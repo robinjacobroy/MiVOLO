@@ -31,10 +31,6 @@ from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 mean=IMAGENET_DEFAULT_MEAN,
 std=IMAGENET_DEFAULT_STD
 
-#Read data file from the server
-import boto3
-from botocore.client import Config
-
 import logging
 
 import configparser
