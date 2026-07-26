@@ -1,0 +1,688 @@
+# Fine-tune MiVOLO (age regression + gender classification) on custom data.
+# Original author: Robin Jacob Roy
+#
+# This revision keeps the custom Dataset (6-channel face+body stack, dual target)
+# and training loop, but delegates optimisation to timm's factories:
+#   create_optimizer_v2 -> layer-wise LR decay + bias/norm weight-decay filtering
+#   create_scheduler_v2 -> warmup + cosine, per-update stepping
+#   NativeScaler        -> AMP scale/backward/unscale/clip/step/update
+#   ModelEmaV3          -> weight averaging
+#   CheckpointSaver     -> top-N retention + model_best.pth.tar
+#
+# NOTE ON SCHEDULER SEMANTICS: timm schedulers are NOT torch.optim.lr_scheduler
+# compatible. A bare scheduler.step() silently misbehaves. You must call
+# step_update(num_updates=...) per iteration and step(epoch + 1, metric=...) per
+# epoch. That is done below.
+
+import argparse
+import gc
+import logging
+import os
+import random
+import time
+from datetime import datetime
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+import timm
+from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+from timm.optim import create_optimizer_v2
+from timm.scheduler import create_scheduler_v2
+from timm.utils import AverageMeter, CheckpointSaver, NativeScaler, get_outdir, unwrap_model
+
+# Registers mivolo_d1_224 with timm's model registry (side-effect import).
+from mivolo.model import mivolo_model  # noqa: F401
+
+# ModelEma moved names across timm releases.
+try:
+    from timm.utils import ModelEmaV3 as ModelEma
+
+    _EMA_KW = {}
+except ImportError:  # timm < 1.0
+    from timm.utils import ModelEmaV2 as ModelEma
+
+    _EMA_KW = {}
+
+# Resume helpers live in timm.models on 0.9+, timm.models.helpers on older.
+try:
+    from timm.models import load_checkpoint, resume_checkpoint
+except ImportError:
+    from timm.models.helpers import load_checkpoint, resume_checkpoint
+
+cv2.setNumThreads(0)  # must precede DataLoader worker fork
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+AMP_ENABLED = DEVICE.type == "cuda"
+
+PRETRAINED_PATH = "models/model_imdb_cross_person_4.22_99.46.pth.tar"
+RESUME_PATH = None  # a checkpoint written by THIS script (CheckpointSaver format)
+ANNOTATION_PATH = "YOLO_annotations.csv"
+IMAGE_ROOT = "data/AgeGender/FaceData/data"
+OUTPUT_ROOT = "output"
+
+MODEL_NAME = "mivolo_d1_224"
+BATCH_SIZE = 128
+N_EPOCHS = 500
+COOLDOWN_EPOCHS = 5
+NUM_WORKERS = 4
+IMG_SIZE = 224
+
+LEARNING_RATE = 1.5e-5
+WEIGHT_DECAY = 5e-5
+LAYER_DECAY = 0.75  # None to disable
+WARMUP_EPOCHS = 3
+WARMUP_LR = LEARNING_RATE * 0.1
+MIN_LR = LEARNING_RATE * 0.01
+CLIP_GRAD = 5.0
+GENDER_LOSS_WEIGHT = 0.3
+
+USE_EMA = True
+EMA_DECAY = 0.9998
+CHANNELS_LAST = False
+TORCH_COMPILE = False
+
+# Augmentation
+AUG_HFLIP_P = 0.5
+AUG_BOX_JITTER = 0.05
+AUG_COLOR_JITTER = 0.2
+DROP_FACE_P = 0.15  # modality dropout keeps the body-only pathway alive
+DROP_PERSON_P = 0.05
+
+# VERIFY against mivolo/model/mi_volo.py — the reference implementation
+# concatenates FACE first, then PERSON. Wrong order silently wastes the
+# pretrained weights.
+FACE_FIRST = True
+
+SEED = 0
+EARLY_STOP_PATIENCE = 15
+EARLY_STOP_MIN_DELTA = 0.1
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+
+MEAN = np.array(IMAGENET_DEFAULT_MEAN, dtype=np.float32)
+STD = np.array(IMAGENET_DEFAULT_STD, dtype=np.float32)
+
+LOG = logging.getLogger("mivolo")
+print(f"timm version: {timm.__version__}")
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+_start_time = None
+
+
+def start_timer():
+    global _start_time
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    _start_time = time.time()
+
+
+def end_timer_and_print(msg):
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"\n{msg}")
+    print(f"Total execution time = {time.time() - _start_time:.3f} sec")
+    if torch.cuda.is_available():
+        print(f"Max memory used by tensors = {torch.cuda.max_memory_allocated()} bytes")
+
+
+class EarlyStopper:
+    def __init__(self, patience=1, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = float("inf")
+
+    def early_stop(self, value):
+        if value < self.min_validation_loss:
+            self.min_validation_loss = value
+            self.counter = 0
+        elif value > (self.min_validation_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Image preprocessing
+# ---------------------------------------------------------------------------
+
+
+def class_letterbox(im, new_shape=(640, 640), color=(0, 0, 0), scaleup=True):
+    """Resize with unchanged aspect ratio, black padding — as MiVOLO expects."""
+    shape = im.shape[:2]
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+    if shape[0] == new_shape[0] and shape[1] == new_shape[1]:
+        return im
+
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    if not scaleup:
+        r = min(r, 1.0)
+
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    dw = (new_shape[1] - new_unpad[0]) / 2
+    dh = (new_shape[0] - new_unpad[1]) / 2
+
+    if shape[::-1] != new_unpad:
+        im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    return cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+
+
+def resize_and_preprocess(img, size=IMG_SIZE):
+    if img is None or img.size == 0:
+        raise ValueError("empty crop passed to resize_and_preprocess")
+    img = class_letterbox(img, new_shape=(size, size))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img.astype(np.float32) / 255.0
+    img = (img - MEAN) / STD
+    return torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))
+
+
+def _blank(size=IMG_SIZE):
+    black = (np.zeros((size, size, 3), dtype=np.float32) - MEAN) / STD
+    return torch.from_numpy(np.ascontiguousarray(black.transpose(2, 0, 1)))
+
+
+BLANK = _blank()
+
+
+def clamp_box(x0, y0, x1, y1, w, h):
+    x0, x1 = int(round(max(0, min(x0, w)))), int(round(max(0, min(x1, w))))
+    y0, y1 = int(round(max(0, min(y0, h)))), int(round(max(0, min(y1, h))))
+    if x1 <= x0:
+        x0, x1 = max(0, x1 - 1), min(w, x0 + 1)
+    if y1 <= y0:
+        y0, y1 = max(0, y1 - 1), min(h, y0 + 1)
+    return x0, y0, x1, y1
+
+
+def jitter_box(x0, y0, x1, y1, w, h, frac):
+    bw, bh = x1 - x0, y1 - y0
+    cx = (x0 + x1) / 2 + np.random.uniform(-frac, frac) * bw
+    cy = (y0 + y1) / 2 + np.random.uniform(-frac, frac) * bh
+    s = np.random.uniform(1 - frac, 1 + frac)
+    bw, bh = bw * s, bh * s
+    return clamp_box(cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2, w, h)
+
+
+def color_jitter(img, magnitude):
+    if magnitude <= 0:
+        return img
+    img = img.astype(np.float32)
+    img = img * (1.0 + np.random.uniform(-magnitude, magnitude))
+    img = img + np.random.uniform(-magnitude, magnitude) * 127.5
+    gray = img.mean(axis=2, keepdims=True)
+    img = gray + (img - gray) * (1.0 + np.random.uniform(-magnitude, magnitude))
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+
+class MiVOLODataset(Dataset):
+    """6-channel face+body stack with (normalised age, gender) targets.
+
+    timm's create_dataset/create_loader assume one 3-channel image and one int
+    label, so this stays hand-rolled. The augmentation must also stay coupled
+    across the two crops (a flip has to apply to both), which timm's per-image
+    PIL transform pipeline cannot express.
+    """
+
+    def __init__(self, df, age_stats, train=True, image_root=IMAGE_ROOT):
+        self.df = df.reset_index(drop=True)
+        self.min_age, self.max_age, self.avg_age = age_stats
+        self.age_range = float(self.max_age - self.min_age)
+        self.train = train
+        self.image_root = image_root
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, ix):
+        row = self.df.iloc[ix]
+
+        age = torch.tensor((float(row.age) - self.avg_age) / self.age_range, dtype=torch.float32)
+        gender = torch.tensor(int(row.gender), dtype=torch.long)
+
+        path = os.path.join(self.image_root, str(row.img_name))
+        image = cv2.imread(path)
+        if image is None:
+            raise FileNotFoundError(f"could not read image: {path}")
+        h, w = image.shape[:2]
+
+        fx0, fy0, fx1, fy1 = clamp_box(row.face_x0, row.face_y0, row.face_x1, row.face_y1, w, h)
+        px0, py0, px1, py1 = clamp_box(
+            row.person_x0, row.person_y0, row.person_x1, row.person_y1, w, h
+        )
+
+        if self.train and AUG_BOX_JITTER > 0:
+            fx0, fy0, fx1, fy1 = jitter_box(fx0, fy0, fx1, fy1, w, h, AUG_BOX_JITTER)
+            px0, py0, px1, py1 = jitter_box(px0, py0, px1, py1, w, h, AUG_BOX_JITTER)
+
+        face = image[fy0:fy1, fx0:fx1].copy()
+
+        masked = image.copy()
+        masked[fy0:fy1, fx0:fx1] = 0  # body view has the face blacked out
+        person = masked[py0:py1, px0:px1]
+
+        if self.train:
+            if np.random.rand() < AUG_HFLIP_P:
+                face = face[:, ::-1].copy()
+                person = person[:, ::-1].copy()
+            face = color_jitter(face, AUG_COLOR_JITTER)
+            person = color_jitter(person, AUG_COLOR_JITTER)
+
+        face_t = resize_and_preprocess(face)
+        person_t = resize_and_preprocess(person)
+
+        if self.train:
+            r = np.random.rand()
+            if r < DROP_FACE_P:
+                face_t = BLANK.clone()
+            elif r < DROP_FACE_P + DROP_PERSON_P:
+                person_t = BLANK.clone()
+
+        stacked = (
+            torch.cat([face_t, person_t], dim=0)
+            if FACE_FIRST
+            else torch.cat([person_t, face_t], dim=0)
+        )
+        return stacked, age, gender
+
+
+def build_sampler(train_df, bin_width=5):
+    """Inverse-frequency sampling over age BINS, indexed positionally."""
+    bins = train_df["age"].astype(int).values // bin_width
+    bins = bins - bins.min()
+    counts = np.bincount(bins).astype(np.float64)
+    counts[counts == 0] = 1.0
+    weights = 1.0 / counts[bins]
+    return torch.utils.data.WeightedRandomSampler(
+        torch.as_tensor(weights, dtype=torch.double), num_samples=len(weights), replacement=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+
+df = pd.read_csv(ANNOTATION_PATH)
+if df["gender"].dtype == object:
+    df["gender"] = df["gender"].map({"FEMALE": 1, "MALE": 0})
+df = df.dropna(subset=["age", "gender"]).reset_index(drop=True)
+df["gender"] = df["gender"].astype(int)
+
+min_age, max_age = float(df.age.min()), float(df.age.max())
+avg_age = (max_age + min_age) / 2.0  # MiVOLO convention
+AGE_STATS = (min_age, max_age, avg_age)
+AGE_RANGE = max_age - min_age
+
+edges = np.arange(5 * np.floor(min_age / 5), 5 * np.ceil(max_age / 5) + 5, 5)
+y_binned = np.digitize(df["age"].values, edges)
+uniq, cnt = np.unique(y_binned, return_counts=True)
+rare = set(uniq[cnt < 2])
+y_binned = np.array([-1 if b in rare else b for b in y_binned])
+
+train_idx, val_idx = train_test_split(
+    np.arange(len(df)), test_size=0.1, stratify=y_binned, random_state=42
+)
+train_data, val_data = df.iloc[train_idx], df.iloc[val_idx]
+
+train_loader = DataLoader(
+    MiVOLODataset(train_data, AGE_STATS, train=True),
+    batch_size=BATCH_SIZE,
+    num_workers=NUM_WORKERS,
+    pin_memory=True,
+    shuffle=False,
+    sampler=build_sampler(train_data),
+    drop_last=True,
+    persistent_workers=NUM_WORKERS > 0,
+)
+val_loader = DataLoader(
+    MiVOLODataset(val_data, AGE_STATS, train=False),
+    batch_size=BATCH_SIZE,
+    num_workers=NUM_WORKERS,
+    pin_memory=True,
+    shuffle=False,
+    persistent_workers=NUM_WORKERS > 0,
+)
+
+print(f"Training samples: {len(train_idx)}  |  Validation samples: {len(val_idx)}")
+print(f"Age range: {min_age:.0f}-{max_age:.0f}  (avg {avg_age:.1f})")
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+model = timm.create_model(MODEL_NAME, pretrained=False, num_classes=3, in_chans=6)
+
+if PRETRAINED_PATH:
+    pre = torch.load(PRETRAINED_PATH, map_location="cpu", weights_only=False)
+    state = pre.get("state_dict", pre.get("model", pre))
+    state = {k.replace("module.", "", 1): v for k, v in state.items()}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    print(f"pretrained load: {len(missing)} missing, {len(unexpected)} unexpected keys")
+
+model = model.to(DEVICE).float()  # master weights fp32; AMP handles casting
+if CHANNELS_LAST:
+    model = model.to(memory_format=torch.channels_last)
+
+age_criterion = nn.SmoothL1Loss(beta=0.1)
+gender_criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+
+
+# --- Optimiser: replaces hand-rolled decay/no-decay param groups -------------
+# create_optimizer_v2 reads model.no_weight_decay() and model.group_matcher()
+# internally, so bias/norm/cls_token/pos_embed exclusion and layer-wise decay
+# come for free. group_matcher may be absent on some MiVOLO forks.
+try:
+    optimizer = create_optimizer_v2(
+        model,
+        opt="adamw",
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+        layer_decay=LAYER_DECAY,
+    )
+    print(f"optimiser: adamw, layer_decay={LAYER_DECAY}, {len(optimizer.param_groups)} groups")
+except (AttributeError, TypeError) as exc:
+    print(f"layer-wise decay unavailable ({exc}); retrying without it")
+    optimizer = create_optimizer_v2(
+        model, opt="adamw", lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    )
+
+loss_scaler = NativeScaler() if AMP_ENABLED else None
+
+updates_per_epoch = len(train_loader)
+scheduler, total_epochs = create_scheduler_v2(
+    optimizer,
+    sched="cosine",
+    num_epochs=N_EPOCHS,
+    warmup_epochs=WARMUP_EPOCHS,
+    warmup_lr=WARMUP_LR,
+    min_lr=MIN_LR,
+    cooldown_epochs=COOLDOWN_EPOCHS,
+    step_on_epochs=False,  # smooth per-iteration warmup
+    updates_per_epoch=updates_per_epoch,
+)
+print(f"scheduler: cosine, {total_epochs} total epochs (incl. {COOLDOWN_EPOCHS} cooldown)")
+
+model_ema = None
+if USE_EMA:
+    try:
+        model_ema = ModelEma(model, decay=EMA_DECAY, device=DEVICE, **_EMA_KW)
+    except Exception as exc:
+        print(f"EMA unavailable ({exc}); continuing without it")
+
+if TORCH_COMPILE:
+    model = torch.compile(model)
+
+
+# ---------------------------------------------------------------------------
+# Resume
+# ---------------------------------------------------------------------------
+
+start_epoch = 0
+if RESUME_PATH:
+    resume_epoch = resume_checkpoint(
+        model, RESUME_PATH, optimizer=optimizer, loss_scaler=loss_scaler, log_info=True
+    )
+    if resume_epoch is not None:
+        start_epoch = resume_epoch
+    if model_ema is not None:
+        load_checkpoint(unwrap_model(model_ema), RESUME_PATH, use_ema=True)
+    # timm schedulers derive LR from the step count, so no state to restore —
+    # just fast-forward to the right position.
+    scheduler.step_update(num_updates=start_epoch * updates_per_epoch)
+    print(f"Resumed at epoch {start_epoch}")
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+output_dir = get_outdir(OUTPUT_ROOT, f"{MODEL_NAME}_{timestamp}")
+
+# CheckpointSaver serialises `args` verbatim into every checkpoint, which is the
+# idiomatic place to stash the age normalisation constants inference needs.
+# Read them back at inference with: torch.load(ckpt)["args"].avg_age
+args = argparse.Namespace(
+    arch=MODEL_NAME,
+    min_age=min_age,
+    max_age=max_age,
+    avg_age=avg_age,
+    face_first=FACE_FIRST,
+    no_gender=False,
+    with_persons_model=True,
+    img_size=IMG_SIZE,
+    gender_loss_weight=GENDER_LOSS_WEIGHT,
+)
+
+saver = CheckpointSaver(
+    model=model,
+    optimizer=optimizer,
+    args=args,
+    model_ema=model_ema,
+    amp_scaler=loss_scaler,
+    checkpoint_dir=output_dir,
+    recovery_dir=output_dir,
+    decreasing=True,  # MAE: lower is better
+    max_history=3,
+)
+
+writer = SummaryWriter(os.path.join(output_dir, "tb"))
+logging.basicConfig(
+    filename=os.path.join(output_dir, "train.log"),
+    filemode="w",
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s",
+    datefmt="%m/%d/%Y %I:%M:%S %p",
+)
+print(f"Output directory: {output_dir}")
+
+
+# ---------------------------------------------------------------------------
+# Epoch loops
+# ---------------------------------------------------------------------------
+
+
+def run_epoch(loader, epoch, is_train, num_updates=0):
+    model.train() if is_train else model.eval()
+
+    loss_m, age_m, gen_m = AverageMeter(), AverageMeter(), AverageMeter()
+    abs_err = 0.0
+    correct = 0
+    n_seen = 0
+
+    tag = "Train" if is_train else "Val"
+    looper = tqdm(loader, desc=f"Epoch {epoch + 1}/{total_epochs} {tag}")
+
+    for im, age, gen in looper:
+        im = im.to(DEVICE, non_blocking=True)
+        if CHANNELS_LAST:
+            im = im.contiguous(memory_format=torch.channels_last)
+        age = age.to(DEVICE, non_blocking=True, dtype=torch.float32)
+        gen = gen.to(DEVICE, non_blocking=True, dtype=torch.long)
+        bs = age.size(0)
+
+        with torch.set_grad_enabled(is_train):
+            with torch.autocast("cuda", dtype=torch.float16, enabled=AMP_ENABLED):
+                out = model(im)
+
+            # Losses in fp32 for stability.
+            pred_age = out[:, 2].float()
+            gender_logits = out[:, :2].float()
+            age_loss = age_criterion(pred_age, age)
+            gen_loss = gender_criterion(gender_logits, gen)
+            total_loss = age_loss + GENDER_LOSS_WEIGHT * gen_loss
+
+        if not torch.isfinite(total_loss):
+            print(f"Warning: non-finite {tag} loss; skipping batch.")
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        if is_train:
+            # NativeScaler does scale -> backward -> unscale -> clip -> step ->
+            # update. It does NOT zero grads, so that stays explicit.
+            optimizer.zero_grad(set_to_none=True)
+            if loss_scaler is not None:
+                loss_scaler(
+                    total_loss,
+                    optimizer,
+                    clip_grad=CLIP_GRAD,
+                    clip_mode="norm",
+                    parameters=model.parameters(),
+                )
+            else:
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_GRAD)
+                optimizer.step()
+
+            if model_ema is not None:
+                model_ema.update(model)
+
+            num_updates += 1
+            scheduler.step_update(num_updates=num_updates, metric=total_loss.item())
+
+        with torch.no_grad():
+            denorm_age = age * AGE_RANGE + avg_age
+            denorm_pred = pred_age * AGE_RANGE + avg_age
+            abs_err += torch.abs(denorm_age - denorm_pred).sum().item()
+            correct += (gender_logits.argmax(-1) == gen).sum().item()
+
+        n_seen += bs
+        loss_m.update(total_loss.item(), bs)
+        age_m.update(age_loss.item(), bs)
+        gen_m.update(gen_loss.item(), bs)
+
+        looper.set_postfix(
+            {
+                "loss": round(loss_m.avg, 4),
+                "mae": round(abs_err / max(n_seen, 1), 2),
+                "gacc": round(correct / max(n_seen, 1), 4),
+                "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+            }
+        )
+
+    metrics = {
+        "loss": loss_m.avg,
+        "age_loss": age_m.avg,
+        "gen_loss": gen_m.avg,
+        "mae": abs_err / max(n_seen, 1),
+        "gender_acc": correct / max(n_seen, 1),
+    }
+    return metrics, num_updates
+
+
+# ---------------------------------------------------------------------------
+# Train
+# ---------------------------------------------------------------------------
+
+early_stopper = EarlyStopper(EARLY_STOP_PATIENCE, EARLY_STOP_MIN_DELTA)
+train_losses, val_losses, val_maes = [], [], []
+num_updates = start_epoch * updates_per_epoch
+
+start_timer()
+
+for epoch in range(start_epoch, total_epochs):
+    tr, num_updates = run_epoch(train_loader, epoch, is_train=True, num_updates=num_updates)
+    va, _ = run_epoch(val_loader, epoch, is_train=False)
+
+    # Per-epoch scheduler step. Must come AFTER validation because plateau-style
+    # schedules consume the metric.
+    scheduler.step(epoch + 1, metric=va["mae"])
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    LOG.info(
+        f"Epoch = {epoch + 1} : Train MAE = {tr['mae']:.3f}, Val MAE = {va['mae']:.3f}, "
+        f"Train loss = {tr['loss']:.4f}, Val loss = {va['loss']:.4f}, "
+        f"Val gender loss = {va['gen_loss']:.4f}, Val gender acc = {va['gender_acc']:.4f}"
+    )
+    writer.add_scalars("Loss", {"Training": tr["loss"], "Validation": va["loss"]}, epoch + 1)
+    writer.add_scalars("MAE", {"Training": tr["mae"], "Validation": va["mae"]}, epoch + 1)
+    writer.add_scalar("Validation Gender Accuracy", va["gender_acc"], epoch + 1)
+    writer.add_scalar("LR", optimizer.param_groups[0]["lr"], epoch + 1)
+    writer.flush()
+
+    # decreasing=True was set on the saver, so it tracks the minimum and
+    # maintains model_best.pth.tar itself.
+    result = saver.save_checkpoint(epoch, metric=va["mae"])
+    best_metric, best_epoch = result if result is not None else (va["mae"], epoch)
+
+    elapsed = time.time() - _start_time
+    done = epoch - start_epoch + 1
+    remaining = (total_epochs - epoch - 1) * (elapsed / done)
+    print(
+        f"{epoch + 1}/{total_epochs} ({elapsed:.0f}s elapsed - {remaining:.0f}s remaining)\n"
+        f"  Train Loss: {tr['loss']:.4f}  Val Loss: {va['loss']:.4f}\n"
+        f"  Val MAE: {va['mae']:.3f} (best {best_metric:.3f} @ epoch {best_epoch + 1})  "
+        f"Val Gender Acc: {va['gender_acc']:.4f}"
+    )
+
+    train_losses.append(tr["loss"])
+    val_losses.append(va["loss"])
+    val_maes.append(va["mae"])
+
+    if early_stopper.early_stop(va["mae"]):
+        print(f"Early stopping at epoch {epoch + 1}")
+        break
+
+end_timer_and_print("Mixed precision (timm NativeScaler):")
+writer.close()
+print(f"Best Val MAE: {best_metric:.3f} @ epoch {best_epoch + 1}")
+print(f"Best checkpoint: {os.path.join(output_dir, 'model_best.pth.tar')}")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+axes[0].plot(train_losses, label="Train Loss")
+axes[0].plot(val_losses, label="Validation Loss")
+axes[0].set_title("Training and Validation Losses")
+axes[0].set_xlabel("Epoch")
+axes[0].set_ylabel("Loss")
+axes[0].legend()
+
+axes[1].plot(val_maes, label="Validation Age MAE", color="tab:red")
+axes[1].set_title("Validation Age MAE")
+axes[1].set_xlabel("Epoch")
+axes[1].set_ylabel("MAE (years)")
+axes[1].legend()
+
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "training_curves.png"), dpi=120)
+print(f"Saved {os.path.join(output_dir, 'training_curves.png')}")
